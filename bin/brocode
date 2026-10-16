@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# brocode CLI launcher wrapper (symlink safe)
+# Compatibility launcher; the installed console entrypoint is authoritative.
+set -euo pipefail
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
   SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )/.." >/dev/null 2>&1 && pwd )"
-VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
-
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "❌ Virtual environment not found in $SCRIPT_DIR/.venv"
-    exit 1
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." >/dev/null 2>&1 && pwd)"
+if [ ! -x "$ROOT/.venv/bin/brocode" ]; then
+  printf '%s\n' 'Install Brocode first: uv sync --locked' >&2
+  exit 1
 fi
-
-exec "$VENV_PYTHON" "$SCRIPT_DIR/brocode.py" "$@"
+exec "$ROOT/.venv/bin/brocode" "$@"

@@ -1,26 +1,14 @@
-#!/usr/bin/env python3
+"""Token-based CAPTCHA plumbing preserved from captcha_solver.py.
+
+No global watchdog patch: all solving and token injection goes through the same
+scope/operation/approval policy as other mutations. Hard blocks are terminal.
+The legacy top-level selftest remains untouched; this module never drives tiles.
 """
-Local CAPTCHA solver for brocode, backed by NoCaptchaAI.
-
-browser-use's CaptchaWatchdog only listens for BrowserUse.captchaSolverStarted
-and Finished CDP events, which a cloud browser proxy emits. On a local Chrome
-nothing ever sends them, so the agent is left to click image tiles by eye and
-loses. This module closes that gap.
-
-The real primitive is not tile clicking. Read data-sitekey and the page URL,
-hand them to NoCaptchaAI, receive a g-recaptcha-response token, inject it. This
-subclass overrides wait_if_captcha_solving, which the agent step loop already
-awaits, so the solve pauses the agent without touching its control flow.
-
-Run: import and call install(browser_session) after the session starts.
-"""
+from __future__ import annotations
 
 import asyncio
 import os
 import time
-from typing import Any
-
-from browser_use.browser.watchdogs.captcha_watchdog import CaptchaWaitResult, CaptchaWatchdog
 
 API_BASE = os.getenv("NOCAPTCHA_API_BASE", "https://api.nocaptchaai.com")
 API_KEY = os.getenv("NOCAPTCHA_API_KEY", "")
@@ -160,7 +148,7 @@ INJECT_JS_TEMPLATE = r"""
 class NoCaptchaAIClient:
     """Minimal NoCaptchaAI client. Plain JSON over HTTPS, no SDK needed."""
 
-    def __init__(self, api_key: str = None, base_url: str = None):
+    def __init__(self, api_key: str | None = None, base_url: str | None = None):
         self.api_key = api_key if api_key is not None else API_KEY
         self.base_url = (base_url or API_BASE).rstrip("/")
 
@@ -213,15 +201,15 @@ class NoCaptchaAIClient:
         status, body = await asyncio.to_thread(call)
         try:
             data = json.loads(body) if body else {}
-        except Exception:
-            data = {"raw": body[:200]}
+        except ValueError:
+            return False, "Solver returned invalid JSON"
 
         text = json.dumps(data)
         if "Invalid apikey" in text or "invalid apikey" in text.lower():
-            return False, f"key rejected by {self.base_url}: {text[:120]}"
+            return False, "Solver key rejected"
         if isinstance(data, dict) and data.get("errorId"):
-            return False, f"{data.get('errorCode')}: {data.get('errorDescription')}"
-        return True, f"balance: {text[:120]}"
+            return False, "Solver rejected validation"
+        return status == 200, "Solver validation completed"
 
     async def solve_recaptcha_v2(self, website_url: str, website_key: str, invisible: bool = False,
                                  timeout: float = 180.0) -> dict:
@@ -286,7 +274,7 @@ async def wait_for_captcha_state(browser_session, timeout: float = 25.0) -> dict
     while time.time() < deadline:
         try:
             state = await _eval(browser_session, DETECT_JS)
-        except Exception:
+        except Exception:  # noqa: BLE001 - detection failure is non-authorizing
             state = None
         if isinstance(state, dict):
             if state.get("hardBlock"):
@@ -297,174 +285,42 @@ async def wait_for_captcha_state(browser_session, timeout: float = 25.0) -> dict
     return state if isinstance(state, dict) else None
 
 
-class LocalCaptchaWatchdog(CaptchaWatchdog):
-    """Detects and solves captchas on a local browser instead of waiting for
-    cloud-proxy events that will never arrive."""
-
-    async def wait_if_captcha_solving(self, timeout: float | None = None) -> CaptchaWaitResult | None:
-        started = time.time()
-        try:
-            state = await wait_for_captcha_state(self.browser_session, timeout=8.0)
-        except Exception as e:
-            self.logger.debug(f"LocalCaptchaWatchdog: detection failed: {e}")
-            return await super().wait_if_captcha_solving(timeout=timeout)
-
-        if not isinstance(state, dict):
-            return await super().wait_if_captcha_solving(timeout=timeout)
-
-        if state.get("hardBlock"):
-            self.logger.error(
-                "🚫 reCAPTCHA hard block detected: 'sending automated queries'. "
-                "This is unsolvable. A solver cannot help here, only a fresh IP and fingerprint."
-            )
-            return CaptchaWaitResult(
-                waited=True, vendor="recaptcha-hard-block",
-                url=state.get("pageUrl", ""), duration_ms=int((time.time() - started) * 1000),
-                result="failed",
-            )
-
-        kind = state.get("kind")
-        sitekey = state.get("sitekey")
-        if not kind or not sitekey:
-            return await super().wait_if_captcha_solving(timeout=timeout)
-
-        url = state.get("pageUrl", "")
-        self.logger.info(f"🔒 Detected {kind} (sitekey {sitekey[:12]}…), solving via NoCaptchaAI")
-
-        if kind != "recaptcha-v2":
-            self.logger.warning(f"No local solver for {kind} yet, leaving it to the agent")
-            return await super().wait_if_captcha_solving(timeout=timeout)
-
-        client = NoCaptchaAIClient()
-        solved = await client.solve_recaptcha_v2(url, sitekey, timeout=timeout or 180.0)
-
-        if not solved.get("ok"):
-            self.logger.error(f"❌ Solver failed: {solved.get('error')}")
-            return CaptchaWaitResult(
-                waited=True, vendor="nocaptchaai", url=url,
-                duration_ms=int((time.time() - started) * 1000), result="failed",
-            )
-
-        token = solved["token"]
-        report = await _eval(self.browser_session, INJECT_JS_TEMPLATE.replace("__TOKEN__", _js_str(token)))
-        self.logger.info(f"✅ Token injected ({report})")
-
-        await asyncio.sleep(1.0)
-        return CaptchaWaitResult(
-            waited=True, vendor="nocaptchaai", url=url,
-            duration_ms=int((time.time() - started) * 1000), result="success",
-        )
 
 
 def _js_str(value: str) -> str:
-    """Quote a Python string as a JS string literal."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "") + '"'
+    import json
+    return json.dumps(value)
 
 
-def patch() -> type:
-    """Make browser-use use the local solver whenever it builds a captcha watchdog.
-
-    BrowserSession.attach_all_watchdogs does a function-level
-    `from ...captcha_watchdog import CaptchaWatchdog` and then instantiates it,
-    so it would overwrite anything we installed earlier. Swapping the class on
-    the module is order-independent and survives that import.
-    """
-    import browser_use.browser.watchdogs.captcha_watchdog as cc
-
-    LocalCaptchaWatchdog.model_rebuild()
-    cc.CaptchaWatchdog = LocalCaptchaWatchdog
-    return LocalCaptchaWatchdog
-
-
-def install(browser_session) -> LocalCaptchaWatchdog:
-    """Replace the stock (cloud-only) captcha watchdog with the local solver."""
-    LocalCaptchaWatchdog.model_rebuild()
-    watchdog = LocalCaptchaWatchdog(
-        event_bus=browser_session.event_bus,
-        browser_session=browser_session,
-    )
+async def solve_if_present(browser, policy) -> None:
+    state = await _eval(browser, DETECT_JS)
+    if not isinstance(state, dict):
+        return
+    if state.get('hardBlock'):
+        policy.block('CAPTCHA_HARD_BLOCK')
+    if not state.get('kind'):
+        return
+    state = await wait_for_captcha_state(browser, timeout=15)
+    if not state or not state.get('ready') or not state.get('sitekey'):
+        policy.block('CAPTCHA_NEEDS_INPUT')
+    if state.get('kind') != 'recaptcha-v2' or not os.environ.get('NOCAPTCHA_API_KEY'):
+        policy.block('CAPTCHA_NEEDS_INPUT')
+    url = await browser.get_current_page_url()
+    await policy.authorize('solve_captcha', {'kind': 'recaptcha-v2'}, url,
+                           {'widget': 'reCAPTCHA v2', 'effect': 'send page URL/sitekey to configured solver and inject token'})
+    if url != await browser.get_current_page_url():
+        policy.block('PAGE_CHANGED_DURING_APPROVAL')
+    policy.check_scope(url)
     try:
-        watchdog.attach_to_session()
-    except Exception:
-        pass
-    browser_session._captcha_watchdog = watchdog
-    return watchdog
-
-
-async def selftest(url: str = "https://2captcha.com/demo/recaptcha-v2", cdp_url: str = None) -> int:
-    """Prove detection and token injection against a real widget.
-
-    Needs no API key. The token is deliberately fake: we are testing our plumbing,
-    not a real solve. A green selftest means the sitekey is found and the
-    textarea and callback hook accept a token.
-    """
-    import browser_use.browser.watchdogs.captcha_watchdog as cc
-
-    patch()
-    assert cc.CaptchaWatchdog is LocalCaptchaWatchdog, "patch() did not take effect"
-
-    from browser_use import Browser
-
-    cdp_url = cdp_url or os.getenv("CDP_URL", "http://localhost:9222")
-    browser = Browser(cdp_url=cdp_url, captcha_solver=True)
-    await browser.start()
-    cdp_session = await browser.get_or_create_cdp_session()
-
-    await cdp_session.cdp_client.send.Page.navigate(
-        params={"url": url}, session_id=cdp_session.session_id
-    )
-
-    state = await wait_for_captcha_state(browser, timeout=25.0)
-    print(f"detect -> {state}")
-    if not isinstance(state, dict) or state.get("kind") != "recaptcha-v2" or not state.get("sitekey"):
-        print("❌ FAIL: did not find a rendered reCAPTCHA v2 widget on the page")
-        return 1
-    print(f"✅ sitekey found: {state['sitekey']} (ready={state.get('ready')})")
-
-    fake_token = "FAKE_TOKEN_" + "0" * 20
-    report = await _eval(browser, INJECT_JS_TEMPLATE.replace("__TOKEN__", _js_str(fake_token)))
-    print(f"inject -> {report}")
-    if not isinstance(report, dict) or report.get("main", 0) < 1:
-        print("❌ FAIL: no main-document g-recaptcha-response textarea accepted the token")
-        print(f"   (form submit reads the main-document one; report was {report})")
-        return 1
-    print(f"✅ token written: main={report['main']} iframe={report['iframe']} callbackFired={report.get('callbackFired')}")
-
-    verify = await _eval(browser, """
-      (() => {
-        const t = document.querySelector("textarea[name='g-recaptcha-response'], textarea#g-recaptcha-response");
-        return t ? t.value.slice(0, 20) : null;
-      })()
-    """)
-    print(f"readback -> {verify!r}")
-    if verify != fake_token[:20]:
-        print("❌ FAIL: token did not persist in the main-document textarea")
-        return 1
-
-    print("✅ SELFTEST PASSED: detect + inject plumbing is good")
-    import os as _os
-    _os._exit(0)
-
-
-async def main():
-    """Check the solver config without touching a browser."""
-    client = NoCaptchaAIClient()
-    if not client.api_key:
-        print("❌ NOCAPTCHA_API_KEY is not set")
-        return 1
-    try:
-        bal = await client.balance()
-    except Exception as e:
-        print(f"❌ Cannot reach {client.base_url}: {e}")
-        return 1
-    print(f"✅ NoCaptchaAI reachable. Balance response: {bal}")
-    return 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    if "--selftest" in sys.argv:
-        target = sys.argv[sys.argv.index("--selftest") + 1] if len(sys.argv) > sys.argv.index("--selftest") + 1 else "https://2captcha.com/demo/recaptcha-v2"
-        raise SystemExit(asyncio.run(selftest(target)))
-    raise SystemExit(asyncio.run(main()))
+        solved = await NoCaptchaAIClient().solve_recaptcha_v2(url, state['sitekey'])
+    except Exception:  # noqa: BLE001 - vendor exceptions may contain credentials
+        policy.block('CAPTCHA_SOLVER_FAILED')
+    if not solved.get('ok'):
+        policy.block('CAPTCHA_SOLVER_FAILED')
+    if url != await browser.get_current_page_url():
+        policy.block('PAGE_CHANGED_DURING_APPROVAL')
+    policy.check_scope(url)
+    policy.dispatched('solve_captcha')
+    report = await _eval(browser, INJECT_JS_TEMPLATE.replace('__TOKEN__', _js_str(solved['token'])))
+    if not isinstance(report, dict) or not report.get('main'):
+        policy.block('CAPTCHA_INJECTION_FAILED')

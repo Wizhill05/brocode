@@ -1,0 +1,13 @@
+[Unit]
+Description=Brocode virtual browser display
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x720x24 -nolisten tcp
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

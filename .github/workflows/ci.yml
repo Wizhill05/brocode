@@ -1,0 +1,33 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12']
+    env:
+      BROCODE_ROOT: ${{ github.workspace }}
+      ANONYMIZED_TELEMETRY: 'false'
+      PYTHON_DOTENV_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run --locked ruff check --select E4,E7,E9,F,I src tests
+      - run: uv run --locked pytest -q
+      - name: Verify adapters from an unrelated directory
+        working-directory: /tmp
+        run: |
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest \
+            "$GITHUB_WORKSPACE/tests/test_acp.py" \
+            "$GITHUB_WORKSPACE/tests/test_mcp.py" -q
+      - run: uv build

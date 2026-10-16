@@ -1,0 +1,15 @@
+[Unit]
+Description=Brocode browser-only explicit WARP egress
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/brocode
+ExecStart=%h/brocode/.venv/bin/python -m brocode.infra.egress --mode warp
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

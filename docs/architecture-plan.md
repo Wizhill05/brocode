@@ -1,279 +1,85 @@
-# Brocode: a dependable browser specialist
+# Brocode architecture
 
-Status: proposal, not implemented. Based on a read-only source audit plus the explicitly requested home-file consolidation. No browser tasks were executed, no authenticated profile was opened, no files were deleted, no Git repository was initialized, and no T3 settings were changed.
+This document describes the implemented design, not a future proposal or an installation report. See [implementation status](implementation-status.md) for limitations and outstanding validation.
 
-## 1. Product direction
-
-**Brocode should be the browser specialist other agents delegate to—not another general coding agent and not a folder of website scripts.**
-
-A caller supplies an outcome, constraints, permitted files, and an authorization policy. Brocode owns observation, planning, browser actions, recovery, and verification. It returns a typed outcome with evidence. The caller should not need to know the website's selectors or click sequence.
-
-The normal loop becomes:
-
-`request → validate authority → retrieve relevant playbook → acquire profile → preflight → observe/act → verify → persist result → propose learning`
-
-Keep Python and browser-use initially. They already support the successful flows; changing language or browser framework while changing the agent interface would create unnecessary risk. Pin the currently installed browser-use 0.13.10 first, then evaluate upgrades behind tests.
-
-Non-goals for version one: a general shell/code executor, a custom editor, a fleet of parallel browsers sharing one login, a vector database, automatic retraining, a second scheduler, and public remote ACP hosting.
-
-## 2. What the audit actually found
-
-| Finding | Evidence / implication |
-|---|---|
-| No Git repository | `git rev-parse` fails in this folder and its parents. Establish history before refactoring. |
-| Small codebase, large runtime state | Five top-level Python files total 1,514 lines. The folder is roughly 3.3 GB: 1.6 GB Chrome profile, 1.1 GB artifacts, 716 MB virtualenv. This is mostly state, not excessive application code. |
-| No project dependency manifest or test suite found | `.venv` is the effective dependency specification. Capture versions before rebuilding it. |
-| `brocode.py` mixes concerns | Settings, preflight, browser construction, model construction, artifact persistence, and CLI in 425 lines. |
-| Python API bypasses doctor | Only the CLI calls `doctor()` before `run_task()`. All entrypoints must use the same guarded runtime. |
-| No shared task lifecycle | No application-level cross-process profile lease, durable cancellation protocol, result status contract, or submission ledger. A Chrome lock is not a task manager. |
-| Success is not verified | The CLI prints “TASK COMPLETED” after `agent.run()` regardless of whether the requested outcome is independently established. Artifacts have final text and history errors, not a durable verified outcome. |
-| Evidence is incomplete on wrapper failures | Artifact writing happens after a successful return from `agent.run()`. The installed browser-use does its own close in its normal run-finally path; Brocode must still persist failure/cancellation results and manage ownership at its boundary. Do not misdiagnose this as no browser cleanup anywhere. |
-| Runtime files share one namespace | Upload resumes, scraped datasets, screenshots, application summaries, and recordings all live under `artifacts/`. |
-| Documentation is stale | README advertises Chrome-daemon commands and flags absent from today's CLI. AGENTS/APPLYING say weak models are refused, while current code merely warns. |
-| Egress code and stated policy disagree | `local_exit_proxy.py` prefers a local WARP proxy when available, then falls back to Tailscale. Documentation describes Tailscale-only routing. Different host/proxy IPs alone do not prove the intended provider was used. |
-| Sensitive material can leak | Current doctor prints fragments of a solver API key; goals/artifacts may include personal facts. Legacy home scripts contain plaintext login credentials. |
-| A forbidden automation script survives | `apply_glassdoor.py` launches Chrome against the shared profile and uses hardcoded selectors and coordinates, contradicting AGENTS.md. |
-
-Preflight was not run: this audit did not attempt browser execution or debugging a failed live run. Before any later smoke test, run doctor and fix all failures.
-
-## 3. Architecture: one runtime, three adapters
+## One execution boundary
 
 ```text
-T3 / ACP clients ── ACP stdio ──┐
-Other agents ────── MCP tools ───┼── Task runtime / policy / memory
-Humans / scripts ─ CLI or Python┘          │
-                                  exclusive profile lease
-                                           │
-                                 browser-use worker process
-                                           │
-                                  existing Chrome profile
-                                           │
-                              explicitly selected egress route
+CLI / Python / ACP stdio / MCP stdio
+                  |
+       Runtime: contracts, store, memory
+                  |
+   exact scope + profile lease + preflight
+                  |
+       isolated browser-use worker
+                  |
+       persistent Chrome profile
+                  |
+      explicit browser egress proxy
 ```
 
-ACP is **Agent Client Protocol**, not Agent Context Protocol or the unrelated Agent Communication Protocol. ACP gives T3 an agent session, streamed progress, permissions, and cancellation. MCP is an optional tool-facing adapter for agents that cannot act as ACP clients. They must not implement different browser logic.
+Callers supply goals, domain scope, registered uploads, permissions, budgets, and verification checks. They do not supply executable site scripts. The runtime owns validation, lifecycle, durable status, cancellation, operation reservations, and finalization. Adapters translate protocols; they do not implement separate browser engines.
 
-### Small initial code layout
+| Module | Responsibility |
+| --- | --- |
+| `contracts.py` | Strict request/result/event, policy, and verification schemas |
+| `runtime.py` | Profile lease, preflight, worker process, approval bridge, cancellation, durable finalization |
+| `worker.py` | Pinned browser-use integration, guarded action dispatch, page verification, evidence |
+| `policy.py` | Exact-host/action allowlists, payload-bound permissions, upload checks |
+| `store.py` | SQLite tasks, sessions, events, operation ledger, uploads, task definitions |
+| `memory.py` | Validated playbooks, private approvals/facts, retrieval, draft generation |
+| `adapters/` | Official ACP and MCP SDK stdio servers |
+| `infra/` | Browser setup, read-only diagnostics, explicit egress, optional CAPTCHA integration |
 
-```text
-brocode/
-  pyproject.toml               # package, entrypoint, dependency groups
-  uv.lock                     # reproducible environment
-  .env.example                # names/placeholders only
-  .gitignore
-  README.md
-  AGENTS.md                   # concise development + caller rules
-  src/brocode/
-    __init__.py               # public API
-    cli.py                    # run, doctor, status, acp; mcp later
-    contracts.py              # requests/results/events/policy models
-    runtime.py                # lifecycle, leases, cancellation, verification
-    worker.py                 # pinned browser-use adapter + event bridge
-    store.py                  # SQLite tasks, sessions, evidence, retrieval
-    memory.py                 # playbook loading, sanitization, proposals
-    adapters/
-      acp.py                  # official Python ACP SDK
-      mcp.py                  # only when needed by actual callers
-    infra/
-      browser.py              # preserve/refactor stealth.py
-      preflight.py            # common async preflight
-      egress.py               # preserve/refactor local_exit_proxy.py
-      captcha.py              # preserve/refactor captcha_solver.py
-  playbooks/
-    indeed-apply/PLAYBOOK.md   # generalized procedure, no PII
-  docs/
-    architecture-plan.md
-    integration.md
-  tests/                      # unit + ACP + local browser fixture tests
-  archive/                    # private, ignored, non-executable legacy evidence
-  var/                        # private, ignored runtime home
-    state.sqlite3
-    runs/<run-id>/
-    uploads/
-    private-facts/
-    downloads/
-```
+`pyproject.toml` and `uv.lock` define dependencies. New state defaults to the project’s absolute `var/`, with private per-run directories for evidence, worker diagnostics, downloads, and temporary files. Configuration and profile overrides must be absolute. The caller’s cwd does not grant filesystem authority.
 
-This is a target layout, not an instruction to create empty scaffolding now. Split modules when they have real responsibilities; do not add one file per action or website. State defaults to this project's absolute `var/` path, never the caller's working directory or `~/`. An explicit `BROCODE_STATE_DIR` may override it later. The existing `.chrome_profile` remains in place during the first migration, outside Git; changing its path is unnecessary risk.
+## Lifecycle and verification
 
-### Runtime contract
+The runtime persists an initial task before execution. It validates domains, budget support, interactive operation keys, uploads, and memory inputs; acquires an OS profile lease; runs shared preflight; reserves any operation key; then launches the worker. Events and terminal results are persisted on failure and cancellation as well as normal completion.
 
-`TaskRequest`: goal, caller/session identity, optional playbook ID and validated inputs, profile ID, upload handles, allowed domains, authorization scope, idempotency key, step/time/token/cost limits where measurable.
+Statuses: `queued`, `running`, `awaiting_approval`, `needs_input`, `succeeded`, `partial`, `blocked`, `failed`, `cancelled`.
 
-`TaskResult`: run/session IDs, status, structured result, verification state, evidence references, error code, timestamps, actual steps/actions, model configuration, and usage/cost when available. Missing pricing is unknown, not zero.
+The worker independently reads current URL, title, and page text for the caller’s declared substring checks. Only passed declared checks can produce `succeeded`; a model’s `done` or a protocol end-of-turn cannot. These checks do not independently prove every real-world business outcome. Callers must choose meaningful conditions and inspect site records for consequential writes.
 
-Statuses: queued, running, awaiting_approval, needs_input, succeeded, partial, blocked, failed, cancelled. `succeeded` requires the task's declared verification checks. An agent's `done` message alone never establishes it. Distinguish protocol end-of-turn from browser-task success.
+Step and wall-clock budgets are enforced. Requests for hard token/cost caps return `UNSUPPORTED_BUDGET`; cost remains unknown. One action is allowed per step. Unknown tools, raw JavaScript/evaluate, shell, arbitrary file tools, coordinate clicks, and action batches are not caller/model escape hatches. Fixed internal browser inspection is implementation machinery, not a public JavaScript API.
 
-Use UUID/ULID run IDs rather than second-resolution timestamps. Persist an initial task record before execution, append events during it, and finalize in failure/cancellation paths too. Do not infer task failure just because history includes recovered action errors.
+## Authority and ownership
 
-Keep the ACP process responsive while a browser worker runs. Put dependency output on worker stderr and use a dedicated framed event channel; the ACP parent's stdout contains only SDK-generated protocol messages. Do not try to sanitize arbitrary mixed stdout with regexes. No broad shell tools in the worker.
+Observe mode permits navigation and observation but denies interactive actions. Confirm mode requires an operation key and separate permission for each potentially mutating action, including supported clicks, native input, and native selections. Website upload dispatch, global keyboard actions, and automatic CAPTCHA solving are disabled because their targets or callbacks cannot be bound safely. Runtime-built previews bind permission to the live element and form state using a private keyed fingerprint; dispatch rechecks context after approval. Mutations use single-attempt exact-node adapters rather than dependency retry/fallback handlers; an ambiguous failure stops the run as `UNCERTAIN_MUTATION`. Denial, timeout, disconnection, or no approval handler means denial. A webpage, saved playbook, or model cannot grant permission.
 
-### Profile ownership, recovery, and retries
+Exact-host scope is checked before and after actions. Subdomains are not implicitly included. **Navigation and scrolling may have side effects. Redirects can contact an out-of-scope host before detection; the checks are not a network firewall.**
 
-- One active owner per profile across **all** CLI, ACP, MCP, and Python processes. Use an OS file lock, not an in-memory mutex. A database records metadata; it is not the only lock.
-- Initially reject a competing request with `PROFILE_BUSY` rather than starting another Chrome. Add a durable bounded queue only if required.
-- Hold the lease while awaiting an approval if preserving the current page is necessary; bound that wait and expose its state. An approval approves a particular preview/payload, not an unlimited session.
-- Cancellation stops the agent, drains evidence, closes only its owned Chrome, and releases the lease. A timed-out worker gets bounded graceful shutdown then ownership-scoped termination. Never kill all Chrome processes.
-- A restarted session restores conversation/task metadata, not a promise that the same live page or half-filled form still exists. Reobserve before continuing.
-- Retry transient reads/navigation within budgets. Never automatically replay an uncertain submission. Reconcile against site records first; return `partial`/uncertain if reconciliation is unavailable.
-- Keep a submission ledger keyed by account/site/business object and operation. Idempotency is best effort: no universal exactly-once guarantee exists for arbitrary websites.
+An OS lease prevents simultaneous tasks from owning the same profile, even across processes. Contention returns `PROFILE_BUSY`; there is no multi-profile fleet or durable browser queue. Cancellation cleans up owned processes only, never all Chrome processes. Recovery marks proven-dead owners interrupted; it neither restores a live tab nor replays an operation.
 
-## 4. ACP and T3 integration
+Request idempotency deduplicates caller requests; operation keys reserve a business operation. Reconciliation requires a terminal owning task and a finalized operation, with an atomic expected-state update. Active/reserved work cannot be reopened. Interrupted writes remain uncertain until evidence-based reconciliation against site records. Arbitrary websites do not provide a universal exactly-once guarantee.
 
-Use the official `agent-client-protocol` Python SDK; do not invent a lookalike protocol. Start with stdio and negotiate the version supported by the installed T3 build. Current public docs include versioned protocol pages, so pin a tested SDK/spec pair instead of assuming latest means compatible.
+## Browser egress and preflight
 
-Implement initialization, session creation, prompt turns, progress/tool updates, permission requests, and cancellation. Add durable session load/list only after correct persistence and transcript replay exist, advertising only implemented capabilities. Use official schema fields—not internal T3 class/function names as wire method names. Do not expose private chain-of-thought; stream task plans and observable actions.
+Model configuration (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `VISION_MODEL`) is separate from `BROCODE_PROXY_URL`, which Chrome uses for browser traffic. A portable model example is `https://api.openai.com/v1` with `gpt-4.1`; configure and validate your chosen service explicitly.
 
-For the v1 baseline, this corresponds to `initialize`, `session/new`, `session/prompt`, `session/update`, `session/request_permission`, and `session/cancel`. v2 or newer features require explicit compatibility tests.
+`brocode.infra.egress` is a loopback HTTP/CONNECT proxy with a required `--mode` and no provider fallback:
 
-**Installed T3 integration was inspected, not exercised.** Build `0.0.46-nightly.20261015.3171` includes an `acpRegistry` driver with a local-command source and `commandPath`/`commandArgs`. The intended provider entry is:
+- **WARP:** `--mode warp` forwards through a separately configured loopback WARP HTTP proxy. `--warp-host` and `--warp-port` select its upstream. The supplied service template selects WARP.
+- **Tailscale:** `--mode tailscale --source-ip "$BROWSER_SOURCE_IP"` binds outbound connections to an operator-selected local source address. An explicit IPv4 source is required in Tailscale mode; there is no default. WARP mode does not require a source address. Preflight requires a priority-5200 source-scoped rule for table 52, a priority-5260 main-table rule, table 52’s default through `tailscale0`, an online selected exit node, and compatible rule precedence.
 
-```json
-{
-  "brocode": {
-    "driver": "acpRegistry",
-    "displayName": "Brocode",
-    "enabled": true,
-    "config": {
-      "source": "local",
-      "commandPath": "/home/gujju-azure/brocode/.venv/bin/brocode",
-      "commandArgs": ["acp"],
-      "enabled": true
-    }
-  }
-}
-```
+Adapt the `deploy/` templates to `/absolute/path/to/brocode` and your chosen mode; changing `.env` alone does not reconfigure a running service. Manage infrastructure separately from tasks. Never change host-wide routing or system proxy settings as a runtime repair.
 
-This is a **proposed fragment under `providerInstances`**, not a complete settings file and not a command to run today. The installed executable does not exist yet. Register through T3's provider settings when possible; otherwise back up and schema-validate the settings merge. Never replace the whole user's settings. Do not put credentials in the example.
+Before browser execution/debugging, run `brocode doctor` and fix every failed check. All execution interfaces repeat shared preflight. Diagnostics verify the listener/process identity, selected mode, route health, selected-route/proxy IP equality, host/proxy isolation, Chrome, X display, profile locks, and required configuration. Doctor uses network probes but does not launch Chrome, repair routing, or remove locks. Model configuration presence is not a successful model API call.
 
-First integration gate: an SDK-backed minimal agent appears in T3, passes its probe, receives a prompt, streams an update, handles denial/cancel, and exits cleanly. Confirm the provider is listed with `canRunChildTask: true` in `orchestrator_capabilities` before claiming other T3 agents can delegate to it. Use the returned provider/model IDs, not a guessed `brocode/default` model. Model/options should be exposed through the negotiated session capabilities/configuration supported by that T3/SDK pair.
+`brocode repair-profile-lock` is a separate, preview-first maintenance command. Only explicit `--apply` removes validated stale singleton symlinks after proving a local owner dead and the profile unused, under the Brocode lease. Apply records private audit evidence. Live/unknown owners, unsafe paths, or incomplete inspection block repair; it never launches/kills Chrome or clears cookies. It cannot make checks/unlink atomic against an independently launched process; keep such launches stopped during repair.
 
-Once this passes, T3's `delegate_task` should target that registered instance. Other ACP clients can spawn `brocode acp`; clients that only speak MCP use `brocode mcp` later. Proposed MCP tools: task start/status/cancel/result, playbook list/inspect, and private upload registration. Long browser work returns a run ID rather than forcing a tool connection to wait indefinitely. No raw click/selector escape hatch.
+## Memory and private data
 
-T3 may inject MCP/orchestration context into ACP agents. Brocode does not need arbitrary orchestration tools to browse; do not forward injected tokens to the browser LLM, web pages, memories, or artifacts. Avoid recursive delegation.
+Procedural memory consists of inert Markdown with validated metadata and bounded lexical retrieval. Local approval is bound to content/version; verification age, backend changes, and repeated failures can invalidate trust. Drafts require explicit review before approval/use. Verified runs generate generic draft templates, not unrestricted model-written site procedures.
 
-## 5. Memory that actually improves repeatability
+Private facts require provenance, deliberate approval, and review expiry. Required unknown answers must be requested, not invented. Inputs and facts remain per-run/private, never reusable public procedure content. Saved memory grants no authority.
 
-I interpret the requested reusable “.empty file” as a saved procedure. A literally empty file cannot store that knowledge. Use Markdown with validated YAML front matter, conventionally `PLAYBOOK.md`; a different extension can be supported if you specifically want it.
+Upload registration copies a caller-selected absolute regular file into private storage with integrity checks; it is not authorization to send it. Local stdio clients are trusted: registration is not a remote filesystem sandbox. Worker environment forwarding is allowlisted; orchestration credentials and arbitrary client MCP servers are not forwarded.
 
-Keep four things distinct:
+Recordings, screenshots, goals, transcripts, results, and logs may contain sensitive content despite redaction. Keep them private and review retention explicitly. Routine diagnostics can be pruned; write evidence and durable records are retained. Public source must exclude configuration secrets, profiles, runtime state, private archives, uploads, and handoff notes.
 
-1. **Procedural memory:** sanitized, versioned goal-based playbooks.
-2. **Personal facts:** private, user-approved records with provenance and review dates; not inside reusable prompts committed to Git.
-3. **Episodic evidence:** private task ledger and run artifacts.
-4. **Scheduled/preassigned work:** task definitions referring to a playbook and validated inputs, not conversation memory masquerading as a scheduler.
+## Integration boundaries
 
-Example procedure:
+ACP provides text-only sessions, progress, permissions, cancellation, and transcript list/load. MCP provides asynchronous goal-level tools but denies approval. Both use local stdio and official SDKs with protocol-only stdout. Neither exposes a general terminal, browser scripting API, remote authenticated service, or arbitrary client-supplied MCP connections.
 
-```markdown
----
-id: indeed-apply
-version: 1
-status: draft
-scope: account-owner-approved job application
-domains: [indeed.com, smartapply.indeed.com]
-required_inputs: [job_url, resume_handle, applicant_facts_ref]
-authorization: confirm_before_submit
-verification: [confirmation_observed, application_record_observed]
----
-# Apply to the specified role
-Check the role and requirements against current approved applicant facts.
-Use the registered resume; answer only from those facts.
-Observe the current form and adapt; do not replay selectors or coordinates.
-Ask when a required answer is unknown. Preview the submission and await approval.
-After submission, check confirmation and the account's application record.
-If the outcome is uncertain, reconcile before attempting another submission.
-```
-
-Workflow discovery → retrieve by ID/domain/title/tags with SQLite FTS and bounded selection → validate inputs → execute → check evidence → propose a sanitized new version. Auto-save a draft after a verified run; explicitly approve promotion to trusted procedure. Failed/uncertain attempts may produce a failure note, never a trusted success recipe. Store source run IDs, last-verified date, backend version, known failure conditions, and staleness markers.
-
-One success is useful evidence, not proof that a website flow is permanently solved. Invalidate/review a playbook when the site changes, it repeatedly fails, or its policy changes. Import `APPLYING.md` as a seed only after checking its claimed confirmation evidence. Do not blindly reuse old salary, availability, work-authorization, experience, or education claims; time-sensitive personal facts require review. Unknown required screening answers require input, not a guessed minimum.
-
-No vector store initially. Add semantic retrieval only if measured retrieval misses justify it. No executable code inside playbooks, and page text must never become trusted instructions or user authorization.
-
-## 6. Safety and operational boundaries
-
-- Preserve the existing browser/profile/recording/egress infrastructure during migration. Refactor with tests; do not delete or replace stealth.py, captcha_solver.py, or local_exit_proxy.py as a cleanup shortcut.
-- Pick an explicit egress mode; preserve per-browser isolation and never change host-wide Tailscale routing from a task. Do not silently fall back to another provider/IP. Doctor reports selected route and measured health, with secrets redacted.
-- Move preflight into the runtime so no entrypoint bypasses it. Make doctor non-destructive by default; stale-lock repair should be explicit and ownership-checked. Current sync `asyncio.run()` solver check also needs conversion for async callers.
-- Permission policy is enforced at action dispatch, not only in the system prompt. Scope external mutations/uploads to caller authority. Deny unknown or unclassified mutating actions in conservative mode.
-- Audit every available browser-use action, including form submission via keys, JavaScript/evaluate, multi-action batches, downloads, and file writes; disable bypass tools where policy cannot be enforced. Never claim a universal read-only guarantee based on button labels alone. Website navigation can itself have side effects.
-- Approval denial, loss of connection, missing approval support, or timeout means **do not perform the mutation**. Preauthorization must identify operation, scope, account, files, and limits. Saved memory grants no authority.
-- Treat web content as untrusted data; do not follow page instructions to reveal secrets, change policies, or use other accounts. Use scoped domain transitions and registered upload handles; canonicalize paths and reject escapes/symlinks outside permitted roots.
-- Define allowed output paths for browser-use's own filesystem/download tools, not just our wrapper. Never write to caller cwd or home by accident.
-- Store state privately, redact logs before storage, limit recording retention, and keep evidence of external writes longer than routine diagnostics. Recordings may contain PII; a blanket “safe to publish” label is inappropriate.
-- Preserve current captcha infrastructure as an isolated integration. Its absence/failure must produce an honest blocked/human-needed state, never uncontrolled retrying or automatic egress rotation. Solver policy and credentials need explicit operator configuration.
-
-## 7. Cleanup and migration ledger
-
-### Completed with your authorization
-
-Moved 15 home-level files into private `archive/legacy-workflows/`: seven Webex files and eight Tekstac files. Copied one job-data snapshot from `.hermes/saved_5_jobs.json`; the Hermes original remains because provenance/references are uncertain. Every destination is hash-verified in `archive/consolidation-manifest.json`. No deletions. `.gitignore` now excludes `archive/` and `artifacts/`. Archive files are restricted to owner access. Rotate the plaintext password found in the Tekstac scripts.
-
-Scope was home-level files, selected shallow project references, Downloads, selected agent filenames, and matching temporary filenames—not an exhaustive whole-disk attribution exercise. Unrelated projects/configs/unknown images were left untouched.
-
-### Proposed actions during implementation
-
-| Current path | Action | Delete condition |
-|---|---|---|
-| `brocode.py` | Extract into package; keep compatibility `run_task` shim during transition | Remove monolith after Python/CLI callers are migrated and tested |
-| `bin/brocode` | Replace eventually with packaging console entrypoint; update existing global symlink intentionally | Only after installed entrypoint works from any cwd |
-| `stealth.py` | Preserve, move to infra/browser.py after compatibility tests | Never wholesale-delete as clutter |
-| `local_exit_proxy.py` | Preserve and make route explicit; document service ownership | No deletion without a tested replacement and operational migration |
-| `captcha_solver.py` | Preserve behind an optional capability with controlled lifecycle | No deletion as cleanup |
-| `apply_glassdoor.py` | Move to private legacy archive; extract useful goal/verification knowledge | Delete archived copy only after review/backup, not as part of initial refactor |
-| `APPLYING.md` | Separate procedure, personal facts, and historical evidence; remove obsolete instructions | Replace old document only after provenance checked |
-| `AGENTS.md`, `README.md` | Rewrite to match implemented commands, authority boundaries, and file rules | Keep short authoritative docs, not competing runbooks |
-| `.env` | Keep private; add sanitized .env.example, redact diagnostics | Never commit; rotate any exposed secrets |
-| `.chrome_profile/` | Keep exact path initially; offline backup before any later relocation | Never clear/delete as project cleanup |
-| `.venv/` | Capture package versions; rebuild from tested lock later | Delete only after replacement env validated |
-| `.chrome.pid` | Historical daemon marker; inspect process ownership | Remove only when proven stale and unused |
-| `__pycache__/` | Generated bytecode | Safe to clear during migration, regenerated automatically |
-| `artifacts/resume_*.pdf` | Inventory/hash and register as private uploads; update references | Keep distinct versions; no bulk deduplication by filename |
-| `artifacts/task_*.json`, screenshots, recordings | Migrate/import to private run ledger; preserve confirmed outcome evidence | Prune routine media only under reviewed retention policy |
-| `artifacts/*saved*`, categories, movie lists | Archive as user datasets, not agent source or trusted memory | Do not delete user output as “cache” |
-| `candidates.txt` | Review and move into private job-workspace data | Do not infer it is disposable |
-| `archive/` | Non-executable, private legacy evidence | Optional removal only after explicit review/retention decision |
-
-Do not run a sweeping `rm`. Before each relocation check live references, record source/destination/hash, and maintain rollback. State migration should be incremental; the original CLI continues to work until the new package passes the same workflow checks.
-
-### Establish Git safely
-
-First back up source/config and record checksums; back up the authenticated profile only while closed or with an appropriate consistent snapshot. Expand ignore rules for `var/`, runtime media, uploads, credentials, caches, and archives **before** initialization. Run secret scanning, review an explicit source-only staging list, then `git init` and make a baseline commit. Do not use `git add .` on this mixed tree. No remote/public push is needed. Apply changes in small tested commits with migrations and rollback notes.
-
-## 8. Implementation phases and exit gates
-
-1. **Protect and baseline.** Inventory/backup; secret rotation advisory; manifest/lock; source-only Git; truthful docs. Exit: reproducible environment and restore procedure; current behavior characterized.
-2. **Prove ACP ↔ T3.** Minimal SDK adapter and clean stdio with a fake worker first. Verify actual local provider registration, model discovery, progress, permission denial, cancellation, disconnect, and child-task targeting. Exit: T3 can reliably call the specialist; no real submissions.
-3. **Unify the runtime.** Contracts, cross-process profile lease, preflight on every entrypoint, worker event channel, persistent run status, budgets, deterministic cleanup. Exit: CLI/Python/ACP share behavior; parallel calls never share an active profile.
-4. **Enforce policy and verification.** Restrict action set; approval gates; registered files; evidence checks; uncertain-write reconciliation and ledger. Exit: local fixture tests prove denied writes do not occur, including keyboard/script/batch bypass attempts.
-5. **Add playbooks and private facts.** Import sanitized Indeed knowledge; provenance, draft promotion, stale-memory handling, repeat task definitions. Exit: retrieved workflow executes with current inputs and cannot fabricate required answers or expand authority.
-6. **Caller coverage and retention.** Add MCP only for actual non-ACP callers; wire T3 scheduling to saved task definitions instead of creating another daemon. Complete path migration and retire old entrypoints only after compatibility checks. Exit: no new loose files outside configured roots; recovery/retention documented.
-
-Do not promise a delivery date until phase 2 establishes the T3/SDK compatibility boundary. This is several small milestones, not a massive rewrite in one pass.
-
-## 9. Acceptance tests that define “proper agent”
-
-- ACP frames remain valid under noisy browser dependencies, concurrent updates, malformed input, early EOF, permission denial, and cancellation. Use SDK tests plus the experimental ACP TCK where applicable; TCK success is not official complete conformance.
-- Two separate processes targeting the same profile get one owner and one busy result; no second Chrome launch.
-- Python API cannot bypass doctor; no task can silently change host routing or switch egress providers.
-- A browser-use `done` without outcome evidence is not marked succeeded.
-- Failed and cancelled work has durable artifacts and releases owned resources. A fresh request works after an interrupted one.
-- Duplicate keys do not create duplicate task execution; uncertain submits are reconciled, not blindly replayed.
-- A playbook retrieved from a previous successful run supplies procedure, not obsolete PII or permission to submit.
-- Unknown application facts produce a request for input. Prompt injection cannot authorize an upload, external write, arbitrary script, or memory promotion.
-- Tests run from a temporary unrelated cwd prove source/home remain unchanged and all outputs land under the configured private root.
-- Browser integration tests use local synthetic websites through the agent runtime. A live Indeed test is opt-in: prepare/review first, then one specifically authorized submission and an independent records check. Never auto-apply in CI.
-
-## Sources and evidence
-
-Local source audit: brocode.py, stealth.py, local_exit_proxy.py, captcha_solver.py, apply_glassdoor.py, bin/brocode, README.md, AGENTS.md, APPLYING.md, .gitignore; installed browser-use package metadata and lifecycle source. T3 local-command capability was researched from installed build `0.0.46-nightly.20261015.3171`; runtime handshake remains an implementation gate, not a completed test.
-
-Official references:
-- ACP introduction: https://agentclientprotocol.com/get-started/introduction
-- ACP v1 lifecycle: https://agentclientprotocol.com/protocol/v1/overview
-- Stdio framing and transport constraints: https://agentclientprotocol.com/protocol/v1/transports
-- Permission requests/tool events: https://agentclientprotocol.com/protocol/v1/tool-calls
-- Python SDK: https://agentclientprotocol.com/libraries/python
-- Python SDK quickstart: https://agentclientprotocol.github.io/python-sdk/quickstart/
-- Experimental compatibility kit: https://agentclientprotocol.com/libraries/testing
+Session replay restores metadata/transcripts only. Background MCP work belongs to the server lifespan and is cancelled at shutdown. Scheduling is external; unattended callers cannot self-approve. See [integration](integration.md) for portable launch examples.

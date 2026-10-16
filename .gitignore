@@ -20,3 +20,11 @@ dist/
 candidates.txt
 APPLYING.md
 apply_glassdoor.py
+# Private handoffs and machine-specific migration material.
+work/
+omp-html/
+stealth.py
+local_exit_proxy.py
+captcha_solver.py
+# Locally retained history; never publish checkpoint refs or legacy snapshots.
+*.bundle
