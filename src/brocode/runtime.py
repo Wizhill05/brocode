@@ -324,7 +324,14 @@ class Runtime:
                 worker_task = asyncio.create_task(invoke())
                 monitor = asyncio.create_task(self._monitor_cancel(run_dir, worker_task))
                 try:
-                    outcome = await asyncio.wait_for(worker_task, remaining)
+                    # Shield the worker from caller cancellation: settle_worker
+                    # below owns worker teardown, so repeated cancellation waits
+                    # for cleanup instead of aborting it. asyncio.wait_for
+                    # propagates outer cancellation into the inner task on 3.12,
+                    # which killed worker cleanup mid-flight (finished work lost,
+                    # lease released early). Timeout still bounds the wait.
+                    async with asyncio.timeout(remaining):
+                        outcome = await asyncio.shield(worker_task)
                 finally:
                     # A second caller cancellation must not interrupt wait_for's
                     # child cleanup and release the lease while Chrome still exits.
