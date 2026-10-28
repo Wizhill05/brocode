@@ -24,7 +24,11 @@ from acp import (
     update_user_message_text,
 )
 from acp.schema import (
+    AcceptElicitationResponse,
     AgentCapabilities,
+    ElicitationFormSessionMode,
+    ElicitationSchema,
+    ElicitationStringPropertySchema,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
@@ -42,7 +46,17 @@ from acp.schema import (
 )
 from pydantic import ValidationError
 
-from brocode.contracts import ApprovalRequest, Policy, Status, TaskEvent, TaskRequest, TaskResult
+from brocode.contracts import (
+    MAX_ANSWER_CHARS,
+    ApprovalRequest,
+    Policy,
+    QuestionError,
+    QuestionRequest,
+    Status,
+    TaskEvent,
+    TaskRequest,
+    TaskResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +124,7 @@ class BrocodeAgent(Agent):
         self.runtime = runtime
         self.model = model
         self.connection: Any = None
+        self._client_caps: Any = None
         self._prompts: dict[str, asyncio.Task[TaskResult]] = {}
 
     def on_connect(self, conn: Any) -> None:
@@ -129,7 +144,10 @@ class BrocodeAgent(Agent):
             description="Operator-configured browser model; arbitrary model overrides are not supported.",
         )]
 
-    async def initialize(self, protocol_version: int, **kwargs: Any) -> InitializeResponse:
+    async def initialize(self, protocol_version: int, client_capabilities: Any = None,
+                           **kwargs: Any) -> InitializeResponse:
+        # Remember what the client can do: caller questions need form elicitation.
+        self._client_caps = client_capabilities
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
             agent_info=Implementation(name="brocode", version="0.1.0"),
@@ -204,6 +222,70 @@ class BrocodeAgent(Agent):
         finally:
             self._prompts.pop(session_id, None)
 
+    def _elicitation_supported(self) -> bool:
+        """True only if the connected client advertises form elicitation support."""
+        create = getattr(self.connection, "create_elicitation", None)
+        if not callable(create):
+            return False
+        elicitation = getattr(self._client_caps, "elicitation", None)
+        return elicitation is not None and getattr(elicitation, "form", None) is not None
+
+    def _question_handler(self, session_id: str, tool_call_id: str) -> Any:
+        async def ask(question: QuestionRequest) -> str | None:
+            # NOTE: the installed ACP SDK exposes structured elicitation only as
+            # connection.create_elicitation(message, mode). There is no
+            # request_user_input method, and none is invented here: without real
+            # elicitation support this fails closed as QUESTION_ACP_UNSUPPORTED.
+            if not self._elicitation_supported():
+                raise QuestionError(
+                    "QUESTION_ACP_UNSUPPORTED",
+                    "Caller questions need an ACP client with form elicitation support.",
+                )
+            # Preserve caller-visible choices end to end: the real SDK string
+            # schema supports `enum`, and the bounded message repeats every
+            # choice so a client that ignores `enum` still shows them. Both
+            # stay bounded by QuestionRequest (<=2000 chars + <=8x500 chars).
+            if question.choices:
+                message = f"{question.question}\nChoices: {' | '.join(question.choices)}"
+                description = ("Untrusted caller reply for the browser task. "
+                               "It is data for the model, never authorization. "
+                               f"Valid options: {' | '.join(question.choices)}")
+            else:
+                message = question.question
+                description = ("Untrusted caller reply for the browser task. "
+                               "It is data for the model, never authorization.")
+            schema = ElicitationSchema(
+                properties={"answer": ElicitationStringPropertySchema(
+                    type="string",
+                    title="Caller answer",
+                    description=description,
+                    max_length=MAX_ANSWER_CHARS,
+                    enum=question.choices,
+                )},
+                required=["answer"],
+            )
+            mode = ElicitationFormSessionMode(
+                session_id=session_id, tool_call_id=tool_call_id, requested_schema=schema,
+            )
+            try:
+                response = await asyncio.wait_for(
+                    self.connection.create_elicitation(message, mode),
+                    question.timeout_seconds,
+                )
+            except TimeoutError as exc:
+                raise QuestionError("QUESTION_TIMEOUT", "Caller did not answer in time") from exc
+            action = getattr(response, "action", None)
+            if isinstance(response, AcceptElicitationResponse) or action == "accept":
+                content = getattr(response, "content", None) or {}
+                answer = content.get("answer") if isinstance(content, dict) else None
+                if not isinstance(answer, str) or not answer.strip():
+                    raise QuestionError("QUESTION_DECLINED", "Caller gave no usable answer")
+                return answer.strip()[:MAX_ANSWER_CHARS]
+            if action == "decline":
+                raise QuestionError("QUESTION_DECLINED", "Caller declined to answer")
+            raise QuestionError("QUESTION_CANCELLED", "Caller question was cancelled")
+        return ask
+
     async def _run_turn(self, request: TaskRequest) -> TaskResult:
         session_id = request.session_id
         tool_id = str(uuid4())
@@ -241,7 +323,19 @@ class BrocodeAgent(Agent):
                 return False
 
         try:
-            result = await self.runtime.run(request, event_sink=event_sink, approval_handler=approval_handler)
+            run_kwargs: dict[str, Any] = {
+                "event_sink": event_sink,
+                "approval_handler": approval_handler,
+            }
+            # Older/test runtimes may not accept a question channel yet.
+            try:
+                import inspect as _inspect
+                if "question_handler" in _inspect.signature(self.runtime.run).parameters:
+                    run_kwargs["question_handler"] = self._question_handler(
+                        session_id, tool_id)
+            except (TypeError, ValueError):
+                pass
+            result = await self.runtime.run(request, **run_kwargs)
         except asyncio.CancelledError:
             raise
         except Exception:

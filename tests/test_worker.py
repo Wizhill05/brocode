@@ -460,6 +460,111 @@ async def test_browser_start_failure_owns_cleanup_and_diagnostic(tmp_path, monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inspection", ["resolve", "call"])
+async def test_element_inspection_failure_retains_sanitized_diagnostic(tmp_path, inspection):
+    t, policy, _ = tools(tmp_path, mode="confirm")
+    browser = Browser()
+
+    async def fail(**kwargs):
+        raise ValueError("private-api-key /private/profile/secrets")
+
+    getattr(browser, inspection).side_effect = fail
+    result = await t.registry.execute_action("click", {"index": 1}, browser)
+    assert result.error == policy.error_code == "ELEMENT_CONTEXT_UNAVAILABLE"
+    diagnostic = t.outcome.data["diagnostic"]
+    assert diagnostic["type"] == "ValueError"
+    assert diagnostic["frames"][-1]["function"] == "fail"
+    assert diagnostic["frames"][-1]["module"] == "test_worker.py"
+    assert all(set(frame) == {"module", "line", "function"} for frame in diagnostic["frames"])
+    assert "private-api-key" not in t.outcome.model_dump_json()
+    assert "/private" not in t.outcome.model_dump_json()
+    assert all(not Path(frame["module"]).is_absolute() for frame in diagnostic["frames"])
+    assert not policy.mutated and not t.channel.approvals and not browser.mutations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "policy", "screenshot"])
+async def test_error_screenshot_precedes_agent_browser_shutdown(tmp_path, monkeypatch, failure):
+    import tempfile
+
+    import browser_use
+    from browser_use import llm
+
+    from brocode.infra import browser as infra_browser
+
+    events = []
+    browser = Browser()
+
+    async def kill():
+        events.append("kill")
+        browser.closed = True
+
+    async def graceful_close(_browser):
+        events.append("graceful_close")
+        browser.closed = True
+
+    async def screenshot(**kwargs):
+        assert not browser.closed
+        events.append("screenshot")
+        if failure == "screenshot":
+            raise RuntimeError("private-screenshot-error")
+        return {"data": base64.b64encode(b"png").decode()}
+
+    class FailingAgent:
+        def __init__(self, **kwargs):
+            self.tools = kwargs["tools"]
+            self.multi_act = AsyncMock()
+
+        async def run(self, **kwargs):
+            try:
+                if failure == "policy":
+                    browser.resolve.side_effect = ValueError("private-inspection-error")
+                    await self.tools.registry.execute_action("click", {"index": 1}, browser)
+                    return SimpleNamespace(usage=None)
+                raise RuntimeError("private-agent-error")
+            finally:
+                await self.close()
+
+        async def close(self):
+            events.append("agent_close")
+            browser.closed = True
+
+    browser.kill = AsyncMock(side_effect=kill)
+    browser.screenshot.side_effect = screenshot
+    cleanup = AsyncMock(side_effect=lambda: events.append("cleanup"))
+    assert browser_use.Agent is not None
+    monkeypatch.setattr(browser_use, "Browser", lambda **kwargs: browser)
+    monkeypatch.setattr(browser_use, "Agent", FailingAgent)
+    monkeypatch.setattr(llm, "ChatOpenAI", lambda **kwargs: None)
+    monkeypatch.setattr(infra_browser, "browser_kwargs", lambda **kwargs: {})
+    monkeypatch.setattr(infra_browser, "cleanup_owned_processes", cleanup)
+    monkeypatch.setattr(worker, "sanitize_environment", lambda: None)
+    monkeypatch.setattr(worker, "close_browser_gracefully", graceful_close)
+    monkeypatch.chdir(tmp_path)
+    old_tmp = tempfile.tempdir
+    try:
+        outcome = await worker.run_browser({
+            "request": {"goal": "read", "policy": {"allowed_domains": ["example.com"]}},
+            "run_dir": str(tmp_path), "profile_dir": str(tmp_path),
+            "model": "test-model", "base_url": "https://api.example.test/v1",
+            "proxy_url": "http://127.0.0.1:1088", "egress_mode": "warp",
+        }, Channel())
+    finally:
+        tempfile.tempdir = old_tmp
+    assert outcome.error_code == ("ELEMENT_CONTEXT_UNAVAILABLE" if failure == "policy" else "WORKER_ERROR")
+    if failure == "policy":
+        assert outcome.data["diagnostic"]["type"] == "ValueError"
+    if failure == "screenshot":
+        assert outcome.data["evidence_diagnostic"]["type"] == "RuntimeError"
+    else:
+        assert outcome.evidence[0].kind == "screenshot"
+    assert events == ["screenshot", "graceful_close", "agent_close", "kill", "cleanup"]
+    assert "private-" not in outcome.model_dump_json()
+    browser.kill.assert_awaited_once()
+    cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("field,before,after", [
     ("value", "synthetic-old", "synthetic-new"),
     ("checked", False, True),
@@ -667,18 +772,28 @@ async def test_registered_file_upload_is_disabled_before_approval_or_dispatch(tm
 
 
 @pytest.mark.asyncio
-async def test_unsafe_captcha_injector_is_disabled(tmp_path, monkeypatch):
+@pytest.mark.parametrize("state,error", [
+    ({"kind": "recaptcha-v2"}, "CAPTCHA_AUTOMATION_DISABLED"),
+    ({"kind": "turnstile", "ready": True, "sitekey": "synthetic-key"}, "CAPTCHA_AUTOMATION_DISABLED"),
+    ({"kind": "turnstile", "ready": False}, "CAPTCHA_AUTOMATION_DISABLED"),
+    ({"kind": "turnstile", "hardBlock": True}, "CAPTCHA_HARD_BLOCK"),
+    (None, "CAPTCHA_CONTEXT_UNAVAILABLE"),
+])
+async def test_unsafe_captcha_injector_is_disabled(tmp_path, monkeypatch, state, error):
     from brocode.infra import captcha
     from brocode.policy import PolicyBlocked
     t, policy, _ = tools(tmp_path, mode="confirm")
     browser = Browser()
-    monkeypatch.setattr(worker, "cdp_value", AsyncMock(return_value={"kind": "recaptcha-v2"}))
+    monkeypatch.setattr(worker, "cdp_value", AsyncMock(return_value=state))
     solve = AsyncMock()
+    provider = AsyncMock()
     monkeypatch.setattr(captcha, "solve_if_present", solve)
-    with pytest.raises(PolicyBlocked, match="CAPTCHA_AUTOMATION_DISABLED"):
+    monkeypatch.setattr(captcha.NoCaptchaAIClient, "_request", provider)
+    with pytest.raises(PolicyBlocked, match=error):
         await t.audit_captcha(browser)
     solve.assert_not_awaited()
-    assert not policy.mutated
+    provider.assert_not_awaited()
+    assert not policy.mutated and not t.channel.approvals
 
 
 @pytest.mark.asyncio

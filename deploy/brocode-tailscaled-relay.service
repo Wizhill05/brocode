@@ -1,0 +1,31 @@
+[Unit]
+Description=Brocode isolated userspace tailscaled relay (browser-only egress)
+After=network-online.target
+
+# Template only: copy to ~/.config/systemd/user/ and enroll explicitly.
+# Never reuse the host tailscaled socket (/var/run/tailscale/...) or host
+# state. Private state lives under var/tailscaled-relay. This unit does not
+# install, enable, or start anything on its own, and carries no auth key.
+# Operator enrollment (fresh, independent of host login):
+#   tailscale --socket %h/brocode/var/tailscaled-relay/tailscaled.sock up \
+#     --exit-node=<exit-node-IP-or-name> [--exit-node-allow-lan-access=false]
+#   tailscale --socket %h/brocode/var/tailscaled-relay/tailscaled.sock set \
+#     --exit-node=<exit-node-IP-or-name>
+# The up/set selector accepts an exit IP or MagicDNS/host name. For doctor,
+# set --relay-exit-node to the StableNodeID from the socket-scoped status
+# (names/IPs only match the same-ID peer). Flags accept --key=value or
+# --key value; --socket/--state/--statedir must stay canonical under this
+# private dir with no traversal, // alias, or symlinks.
+# Verify: tailscale --socket %h/brocode/var/tailscaled-relay/tailscaled.sock status --json
+
+[Service]
+Type=simple
+WorkingDirectory=%h/brocode
+ExecStart=/usr/sbin/tailscaled --socket %h/brocode/var/tailscaled-relay/tailscaled.sock --state %h/brocode/var/tailscaled-relay/tailscaled.state --statedir %h/brocode/var/tailscaled-relay --tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:8080 --port 0
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

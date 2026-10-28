@@ -70,6 +70,9 @@ class FakeRuntime:
         self.store = FakeStore()
         self.memory = FakeMemory()
         self.jobs = {}
+        from types import SimpleNamespace
+        self.settings = SimpleNamespace(egress_mode="tailscale",
+                                        proxy_url="http://127.0.0.1:1088")
 
     async def run(self, request, event_sink=None, approval_handler=None):
         result = TaskResult(session_id=request.session_id, status=Status.RUNNING)

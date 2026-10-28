@@ -46,7 +46,8 @@ async def test_stdio_tools_background_results_validation_and_shutdown(tmp_path):
             listed = await client.list_tools()
             tools = {tool.name: tool for tool in listed.tools}
             assert set(tools) == {"task_start", "task_status", "task_result", "task_cancel",
-                                  "playbooks_list", "playbook_inspect", "upload_register"}
+                                  "playbooks_list", "playbook_inspect", "upload_register",
+                                   "controller_list", "controller_run"}
             assert "request" in tools["task_start"].input_schema["properties"]
             missing = await client.call_tool("task_start", {"request": {"goal": "read"}})
             assert missing.is_error
@@ -75,6 +76,26 @@ async def test_stdio_tools_background_results_validation_and_shutdown(tmp_path):
             assert (await client.call_tool("playbook_inspect", {"playbook_id": "missing"})).is_error
             assert payload(await client.call_tool("upload_register", {"path": "/approved/resume.pdf"}))["handle"]
             assert (await client.call_tool("upload_register", {"path": "/forbidden/file"})).is_error
+            listed_tools = payload(await client.call_tool("controller_list", {}))
+            if isinstance(listed_tools, dict):  # SDK wraps list output as {"result": [...]}
+                listed_tools = listed_tools["result"]
+            assert {t["name"] for t in listed_tools} == {"egress_status", "capabilities",
+                                                        "challenge_summary"}
+            assert all(t["read_only"] for t in listed_tools)
+            egress = payload(await client.call_tool("controller_run", {"name": "egress_status"}))
+            assert egress["proxy_config_ok"] is True and egress["mode_supported"] is True
+            assert "tailscale-relay" in egress["supported_modes"]
+            caps = payload(await client.call_tool("controller_run", {"name": "capabilities"}))
+            assert any(d["name"] == "automatic_captcha_solving" for d in caps["disabled"])
+            assert any(d["name"] == "live_pause_resume" for d in caps["disabled"])
+            summary = payload(await client.call_tool("controller_run", {
+                "name": "challenge_summary", "args": {"run_id": run_id}}))
+            assert summary["run_id"] == run_id and summary["read_only"] is True
+            assert (await client.call_tool("controller_run", {"name": "arbitrary"})).is_error
+            assert (await client.call_tool("controller_run", {
+                "name": "challenge_summary", "args": {"run_id": "../evil"}})).is_error
+            assert (await client.call_tool("controller_run", {
+                "name": "challenge_summary", "args": {"run_id": "missing"}})).is_error
             started = payload(await client.call_tool("task_start", {
                 "request": {"goal": "wait", "policy": {"allowed_domains": ["example.com"]}}
             }))

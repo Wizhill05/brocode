@@ -36,14 +36,14 @@ def approve(memory, identifier="read-page"):
 
 def test_seed_is_draft_and_not_retrieved(tmp_path):
     memory = Memory(Path(__file__).resolve().parents[1] / "playbooks", Store(tmp_path / "state"))
-    seed = memory.inspect("indeed-apply")
+    seed = memory.inspect("indeed-easy-apply")
     assert seed["status"] == "draft" and not seed["trusted"]
     assert "never_verified" in seed["stale_reasons"]
     assert not memory.retrieve("Apply to Indeed job", ["indeed.com"])
     with pytest.raises(MemoryValidationError):
-        memory.context(TaskRequest(goal="Apply", playbook_id="indeed-apply"))
+        memory.context(TaskRequest(goal="Apply", playbook_id="indeed-easy-apply"))
     with pytest.raises(MemoryValidationError):
-        memory.approve("indeed-apply")
+        memory.approve("indeed-easy-apply")
 
 
 def test_validation_explicit_inputs_and_approval_bound_to_content(memory):

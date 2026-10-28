@@ -90,7 +90,7 @@ def browser_kwargs(
 ) -> dict:
     from .preflight import parse_proxy
     parse_proxy(proxy_url)
-    if egress_mode not in {"tailscale", "warp"}:
+    if egress_mode not in {"tailscale", "warp", "tailscale-relay"}:
         raise ValueError("Explicit egress mode required")
     if not os.environ.get("DISPLAY"):
         raise ValueError("A preflight-checked display is required")

@@ -119,6 +119,13 @@ def parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--caller", default="local")
     reconcile.add_argument("--outcome", choices=["succeeded", "not_sent"], required=True)
     reconcile.add_argument("--evidence", required=True)
+    tools = sub.add_parser("tools", help="Bounded read-only controller helpers; no browser launches")
+    tools_sub = tools.add_subparsers(dest="tools_command", required=True)
+    tools_sub.add_parser("list")
+    tools_run = tools_sub.add_parser("run", help="Run one allowlisted controller tool")
+    tools_run.add_argument("name")
+    tools_run.add_argument("--args", default="{}",
+                           help="JSON object of tool arguments, e.g. '{\"run_id\": \"...\"}'")
     return p
 
 
@@ -271,6 +278,16 @@ async def dispatch(args) -> int:
         runtime.store.reconcile_operation(args.caller, args.key, operation["run_id"],
                                           args.outcome, args.evidence)
         _json(runtime.store.operation(args.caller, args.key))
+    elif args.command == "tools":
+        from .controller_tools import list_tools, run_tool
+        if args.tools_command == "list":
+            _json(list_tools())
+        elif args.tools_command == "run":
+            try:
+                tool_args = json.loads(args.args)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--args must be a JSON object") from exc
+            _json(run_tool(runtime, args.name, tool_args))
     return 0
 
 

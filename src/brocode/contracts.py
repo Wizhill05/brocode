@@ -122,6 +122,74 @@ class ApprovalRequest(StrictModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+MAX_QUESTION_CHARS = 2000
+MAX_QUESTION_CHOICES = 8
+MAX_CHOICE_CHARS = 500
+MAX_ANSWER_CHARS = 2000
+
+# Questions must never solicit caller secrets or credentials. This is a
+# best-effort schema guard, not a substitute for review: it rejects the
+# obvious solicitations, it cannot catch paraphrases.
+_SECRET_QUESTION_MARKERS = (
+    "password",
+    "passcode",
+    "secret",
+    "api key",
+    "api_key",
+    "apikey",
+    "auth token",
+    "access token",
+    "private key",
+    "seed phrase",
+    "credit card",
+    "social security",
+    "one-time",
+    "onetime",
+    "otp",
+    "verification code",
+)
+
+
+class QuestionRequest(StrictModel):
+    """Bounded caller question. Answers are untrusted data, never authority."""
+
+    question_id: str = Field(default_factory=lambda: str(uuid4()))
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+    choices: list[str] | None = Field(default=None, max_length=MAX_QUESTION_CHOICES)
+    timeout_seconds: int = Field(default=120, ge=1, le=300)
+
+    @field_validator("question")
+    @classmethod
+    def question_never_requests_secrets(cls, value: str) -> str:
+        lowered = value.lower()
+        for marker in _SECRET_QUESTION_MARKERS:
+            if marker in lowered:
+                raise ValueError("Questions must never request secrets or credentials")
+        return value
+
+    @field_validator("choices")
+    @classmethod
+    def choices_bounded(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        for choice in value:
+            if not choice or len(choice) > MAX_CHOICE_CHARS:
+                raise ValueError("Choices must be 1-500 characters")
+            lowered = choice.lower()
+            for marker in _SECRET_QUESTION_MARKERS:
+                if marker in lowered:
+                    raise ValueError("Questions must never request secrets or credentials")
+        return value
+
+
+class QuestionError(RuntimeError):
+    """Caller-question failure. `code` is the wire-stable error, never a guess."""
+
+    def __init__(self, code: str, message: str = ""):
+        self.code = code
+        super().__init__(message or code)
+
+
 class WorkerOutcome(StrictModel):
     result: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)

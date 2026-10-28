@@ -113,6 +113,25 @@ def create_server(runtime: Any = None) -> MCPServer:
         except (ValueError, KeyError, OSError) as exc:
             raise ToolError("Upload registration rejected; provide an allowed absolute regular file") from exc
 
+    @server.tool()
+    async def controller_list() -> list[dict[str, Any]]:
+        """List bounded read-only controller helpers (relay status, capability and challenge reports)."""
+        from brocode.controller_tools import list_tools
+        return list_tools()
+
+    @server.tool()
+    async def controller_run(name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Run one allowlisted read-only controller tool by name.
+
+        Unknown names and non-object args are rejected. These tools never launch a
+        browser, approve actions, or solve challenges; they only report.
+        """
+        from brocode.controller_tools import run_tool
+        try:
+            return run_tool(active_runtime(), name, args or {})
+        except (ValueError, KeyError) as exc:
+            raise ToolError(str(exc)) from exc
+
     return server
 
 

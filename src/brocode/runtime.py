@@ -10,15 +10,18 @@ import signal
 import socket
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from dotenv import dotenv_values
 
 from .contracts import (
+    MAX_ANSWER_CHARS,
     TERMINAL,
     ApprovalRequest,
+    QuestionError,
+    QuestionRequest,
     Status,
     TaskEvent,
     TaskRequest,
@@ -30,6 +33,7 @@ from .settings import Settings, private_dir
 
 EventSink = Callable[[TaskEvent], Awaitable[None]]
 ApprovalHandler = Callable[[ApprovalRequest], Awaitable[bool]]
+QuestionHandler = Callable[[QuestionRequest], Awaitable[str | None]]
 
 
 class ProfileBusy(RuntimeError):
@@ -143,7 +147,7 @@ class Runtime:
         self.settings = settings or Settings.load()
         private_dir(self.settings.state_dir)
         self.store = Store(self.settings.state_dir)
-        self.memory = Memory(self.settings.root, self.store)
+        self.memory = Memory(self.settings.root / "playbooks", self.store)
         self._tasks: dict[str, asyncio.Task] = {}
         self._executing: set[str] = set()
         self._worker_runner = worker_runner
@@ -155,10 +159,13 @@ class Runtime:
         if sink:
             await sink(event)
 
-    async def start(self, request: TaskRequest, *, event_sink=None, approval_handler=None) -> str:
+    async def start(self, request: TaskRequest, *, event_sink=None, approval_handler=None,
+                    question_handler: QuestionHandler | None = None) -> str:
         result, created = self.store.create_task(request, model=request.model or self.settings.model)
         if created:
-            task = asyncio.create_task(self._execute(request, result, event_sink, approval_handler))
+            task = asyncio.create_task(
+                self._execute(request, result, event_sink, approval_handler, question_handler)
+            )
             self._tasks[result.run_id] = task
             task.add_done_callback(lambda t: self._background_done(result.run_id, t))
         return result.run_id
@@ -169,7 +176,8 @@ class Runtime:
             with suppress(Exception):
                 task.exception()
 
-    async def run(self, request: TaskRequest, *, event_sink=None, approval_handler=None) -> TaskResult:
+    async def run(self, request: TaskRequest, *, event_sink=None, approval_handler=None,
+                  question_handler: QuestionHandler | None = None) -> TaskResult:
         result, created = self.store.create_task(request, model=request.model or self.settings.model)
         if not created:
             return result
@@ -177,7 +185,7 @@ class Runtime:
         if current:
             self._tasks[result.run_id] = current
         try:
-            return await self._execute(request, result, event_sink, approval_handler)
+            return await self._execute(request, result, event_sink, approval_handler, question_handler)
         finally:
             self._tasks.pop(result.run_id, None)
 
@@ -202,12 +210,15 @@ class Runtime:
             *(t for _, t in tasks if t is not asyncio.current_task()), return_exceptions=True
         )
 
-    async def _execute(self, request, result, sink, approval_handler) -> TaskResult:
+    async def _execute(self, request, result, sink, approval_handler,
+                         question_handler=None) -> TaskResult:
         deadline = asyncio.get_running_loop().time() + request.budget.timeout_seconds
         async with asyncio.timeout_at(deadline):
-            return await self._execute_task(request, result, sink, approval_handler, deadline)
+            return await self._execute_task(request, result, sink, approval_handler,
+                                            question_handler, deadline)
 
-    async def _execute_task(self, request, result, sink, approval_handler, deadline) -> TaskResult:
+    async def _execute_task(self, request, result, sink, approval_handler,
+                            question_handler, deadline) -> TaskResult:
         run_dir = private_dir(self.settings.state_dir / "runs" / result.run_id)
         reserved = False
         self._executing.add(result.run_id)
@@ -299,6 +310,44 @@ class Runtime:
                         result.status, result.updated_at = Status.RUNNING, now()
                         self.store.update(result)
 
+                async def ask(question: QuestionRequest) -> str:
+                    """Live caller question. Browser/session/lease stay up while awaiting."""
+                    # Fail closed: without a caller channel there is no answer to guess.
+                    if question_handler is None:
+                        raise QuestionError(
+                            "QUESTION_HANDLER_REQUIRED",
+                            "No question handler is attached; the caller cannot be asked.",
+                        )
+                    # NEEDS_INPUT is terminal, so mid-run questions deliberately do
+                    # not latch TaskResult.status; the turn stays RUNNING and only
+                    # an event records the wait. Cancellation/timeout settles the
+                    # pending wait via the worker teardown below.
+                    await self._emit(
+                        result.run_id,
+                        TaskEvent(
+                            kind="question",
+                            message=question.question[:280],
+                            data={"question_id": question.question_id},
+                        ),
+                        sink,
+                    )
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    # Settle strictly inside the wall clock (50ms headroom) so the
+                    # pending wait resolves with an explicit code instead of racing
+                    # the outer cancellation teardown.
+                    timeout = min(question.timeout_seconds, remaining - 0.05)
+                    if timeout <= 0:
+                        raise QuestionError("QUESTION_TIMEOUT", "Task wall clock expired")
+                    try:
+                        answer = await asyncio.wait_for(question_handler(question), timeout)
+                    except TimeoutError as exc:
+                        raise QuestionError("QUESTION_TIMEOUT", "Caller did not answer in time") from exc
+                    if answer is None:
+                        raise QuestionError("QUESTION_DECLINED", "Caller declined to answer")
+                    if not isinstance(answer, str) or not answer.strip():
+                        raise QuestionError("QUESTION_DECLINED", "Caller gave no usable answer")
+                    return answer.strip()[:MAX_ANSWER_CHARS]
+
                 async def invoke():
                     if self._worker_runner:
                         return await self._worker_runner(
@@ -308,6 +357,7 @@ class Runtime:
                             context,
                             lambda e: self._emit(result.run_id, e, sink),
                             approve,
+                            ask,
                         )
                     return await self._worker(
                         request,
@@ -316,6 +366,7 @@ class Runtime:
                         context,
                         lambda e: self._emit(result.run_id, e, sink),
                         approve,
+                        ask,
                     )
 
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -376,7 +427,7 @@ class Runtime:
         except TimeoutError:
             result.status, result.error_code = Status.PARTIAL, "TIMEOUT"
             result.result = "Wall-clock limit reached; any uncertain writes require reconciliation."
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - persist a terminal result at the runtime boundary
             result.status, result.error_code = Status.FAILED, type(exc).__name__.upper()
             result.result = _redact(str(exc), self.settings)
         finally:
@@ -384,7 +435,7 @@ class Runtime:
                 status = "succeeded" if result.status == Status.SUCCEEDED else "uncertain"
                 try:
                     self.store.finish_operation(request.caller_id, request.operation_key, result.run_id, status)
-                except Exception:
+                except Exception:  # noqa: BLE001 - ledger failure leaves the operation uncertain
                     result.status, result.error_code = Status.PARTIAL, "OPERATION_FINALIZATION_FAILED"
                     result.result = "Operation ledger finalization failed; do not retry without reconciliation."
                     result.verification = "unknown"
@@ -438,7 +489,8 @@ class Runtime:
         )
         return env
 
-    async def _worker(self, request, run_dir, uploads, context, emit, approve) -> WorkerOutcome:
+    async def _worker(self, request, run_dir, uploads, context, emit, approve,
+                      ask=None) -> WorkerOutcome:
         request_path = run_dir / "worker-request.json"
         # Chrome creates Unix sockets below TMPDIR. UUID run paths can exceed
         # Linux's sockaddr_un limit before Chrome even exposes CDP.
@@ -532,6 +584,39 @@ class Runtime:
                             + "\n"
                         ).encode()
                     )
+                    await writer.drain()
+                elif message["type"] == "question":
+                    question = QuestionRequest.model_validate(message["question"])
+                    try:
+                        if ask is None:
+                            raise QuestionError(
+                                "QUESTION_HANDLER_REQUIRED",
+                                "No question handler is attached; the caller cannot be asked.",
+                            )
+                        answer = await ask(question)
+                        reply: dict = {
+                            "type": "question_response",
+                            "question_id": question.question_id,
+                            "answer": answer,
+                            "error_code": None,
+                        }
+                    except QuestionError as exc:
+                        reply = {
+                            "type": "question_response",
+                            "question_id": question.question_id,
+                            "answer": None,
+                            "error_code": exc.code,
+                        }
+                    except (asyncio.CancelledError, TimeoutError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - handler failures fail closed
+                        reply = {
+                            "type": "question_response",
+                            "question_id": question.question_id,
+                            "answer": None,
+                            "error_code": type(exc).__name__.upper(),
+                        }
+                    writer.write((json.dumps(reply) + "\n").encode())
                     await writer.drain()
                 elif message["type"] == "outcome":
                     outcome = WorkerOutcome.model_validate(message["outcome"])

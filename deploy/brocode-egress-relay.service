@@ -1,0 +1,24 @@
+[Unit]
+Description=Brocode browser-only explicit tailscale-relay egress
+After=network-online.target brocode-tailscaled-relay.service
+
+# Template only: copy to ~/.config/systemd/user/ after the relay daemon is
+# enrolled and healthy. Replace --relay-exit-node with the StableNodeID from
+# the socket-scoped status (preferred stable identity; an exit IP or
+# MagicDNS/host name is accepted only when it belongs to that same-ID peer).
+# Listens on 1089 so it can coexist with the warp (1088)
+# egress; set BROCODE_PROXY_URL=http://127.0.0.1:1089 and
+# BROCODE_EGRESS_MODE=tailscale-relay. `brocode doctor` verifies mode,
+# socket-scoped exit identity, and route IP equality before any browser runs.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/brocode
+ExecStart=%h/brocode/.venv/bin/python -m brocode.infra.egress --mode tailscale-relay --relay-host 127.0.0.1 --relay-port 8080 --relay-socket %h/brocode/var/tailscaled-relay/tailscaled.sock --relay-exit-node REPLACE-WITH-EXIT-NODE-IDENTITY --port 1089
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

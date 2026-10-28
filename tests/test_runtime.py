@@ -1,5 +1,6 @@
 import asyncio
 import multiprocessing
+import shutil
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,16 @@ def request(**kwargs):
     return TaskRequest(
         goal="Read https://example.com", policy=Policy(allowed_domains=["example.com"]), **kwargs
     )
+
+
+def test_runtime_discovers_source_workflows_without_trusting_drafts(settings):
+    source = Path(__file__).resolve().parents[1] / "playbooks"
+    shutil.copytree(source, settings.root / "playbooks")
+    runtime = Runtime(settings)
+    workflows = [p for p in runtime.memory.list() if "indeed" in p["id"]]
+    assert [p["id"] for p in workflows] == ["indeed-easy-apply"]
+    assert workflows[0]["status"] == "draft" and not workflows[0]["trusted"]
+    assert not runtime.memory.retrieve("Indeed Easy Apply", ["indeed.com"])
 
 
 async def test_verification_required(settings):
@@ -110,9 +121,8 @@ async def test_repeated_run_cancellation_waits_for_worker_cleanup(settings):
     task.cancel()
     await asyncio.sleep(0)
     assert not task.done()
-    with pytest.raises(ProfileBusy):
-        with ProfileLease(settings.profile_dir):
-            pass
+    with pytest.raises(ProfileBusy), ProfileLease(settings.profile_dir):
+        pass
     release.set()
     result = await task
     assert finished.is_set()

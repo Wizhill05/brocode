@@ -1,8 +1,7 @@
-"""Token-based CAPTCHA plumbing preserved from captcha_solver.py.
+"""CAPTCHA detection and provider transport; worker solving remains disabled.
 
-No global watchdog patch: all solving and token injection goes through the same
-scope/operation/approval policy as other mutations. Hard blocks are terminal.
-The legacy top-level selftest remains untouched; this module never drives tiles.
+Legacy injection helpers below are retained but are not authorized runtime tools.
+Provider authentication or a returned token does not establish website success.
 """
 from __future__ import annotations
 
@@ -38,8 +37,20 @@ DETECT_JS = r"""
     return child ? child.getAttribute("data-sitekey") : null;
   };
 
-  let host = document.querySelector(".g-recaptcha[data-sitekey]") ||
-             document.querySelector("[data-sitekey]");
+  // Identify Cloudflare first; an arbitrary data-sitekey is not reCAPTCHA.
+  const turnstile = document.querySelector(".cf-turnstile");
+  const cloudflareFrame = Array.from(document.querySelectorAll("iframe")).find((f) => {
+    try { return new URL(f.getAttribute("src"), location.href).hostname === "challenges.cloudflare.com"; }
+    catch (e) { return false; }
+  });
+  if (turnstile || cloudflareFrame) {
+    out.kind = "turnstile";
+    out.sitekey = grab(turnstile);
+    out.ready = !!(out.sitekey && cloudflareFrame);
+    return out;
+  }
+
+  let host = document.querySelector(".g-recaptcha[data-sitekey]");
   if (host) {
     out.kind = "recaptcha-v2";
     out.sitekey = grab(host);
@@ -48,14 +59,16 @@ DETECT_JS = r"""
   if (!out.sitekey) {
     for (const f of document.querySelectorAll("iframe")) {
       const src = f.getAttribute("src") || "";
-      if (src.includes("google.com/recaptcha") || src.includes("recaptcha.net")) {
-        try {
-          const u = new URL(src, location.href);
+      try {
+        const candidate = new URL(src, location.href);
+        if (["www.google.com", "www.recaptcha.net", "recaptcha.net"].includes(candidate.hostname) &&
+            candidate.pathname.startsWith("/recaptcha/")) {
+          const u = candidate;
           out.sitekey = u.searchParams.get("k") || out.sitekey;
           out.kind = "recaptcha-v2";
-        } catch (e) {}
-        break;
-      }
+          break;
+        }
+      } catch (e) {}
     }
   }
 
@@ -66,12 +79,6 @@ DETECT_JS = r"""
         const k = u.searchParams.get("render");
         if (k && k !== "explicit") { out.sitekey = k; out.kind = "recaptcha-v2"; break; }
       } catch (e) {}
-    }
-  }
-
-  if (!out.kind) {
-    if (document.querySelector("iframe[src*='challenges.cloudflare.com'], .cf-turnstile, [data-sitekey*='0x']")) {
-      out.kind = "turnstile";
     }
   }
 
@@ -152,21 +159,113 @@ class NoCaptchaAIClient:
         self.api_key = api_key if api_key is not None else API_KEY
         self.base_url = (base_url or API_BASE).rstrip("/")
 
-    async def _post(self, path: str, payload: dict) -> dict:
+    async def _request(self, path: str, payload: dict | None = None) -> tuple[int, object]:
         import json
+        import urllib.error
         import urllib.request
+
+        if self.base_url != "https://api.nocaptchaai.com":
+            raise ValueError("Solver endpoint not allowed")
+        if ((payload is None and path != "/balance")
+                or (payload is not None and path not in {"/createTask", "/getTaskResult", "/getBalance"})):
+            raise ValueError("Solver operation not allowed")
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise ValueError("Solver redirect denied")
 
         def call():
             req = urllib.request.Request(
                 f"{self.base_url}{path}",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
-                method="POST",
+                data=json.dumps(payload).encode() if payload is not None else None,
+                headers=({"Content-Type": "application/json", "Accept": "application/json"}
+                         if payload is not None else {"apikey": self.api_key, "Accept": "application/json"}),
+                method="POST" if payload is not None else "GET",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+            try:
+                response = opener.open(req, timeout=30)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response as resp:
+                body = resp.read(1_048_577)
+                if len(body) > 1_048_576:
+                    raise ValueError("Solver response too large")
+                return resp.status, json.loads(body.decode())
 
         return await asyncio.to_thread(call)
+
+    async def _post(self, path: str, payload: dict) -> dict:
+        status, data = await self._request(path, payload)
+        if status != 200 or not isinstance(data, dict):
+            raise ValueError("Solver HTTP response invalid")
+        return data
+
+    async def solve_turnstile(self, website_url: str, website_key: str,
+                              timeout: float = 180.0) -> dict:
+        """One remote task, no retries or page injection. Tokens are private.
+
+        A timeout/cancellation can leave a billable remote task. Never infer
+        website success from a returned token.
+        """
+        import math
+        from urllib.parse import urlsplit
+
+        def failure(code: str) -> dict:
+            return {"ok": False, "token": None, "error": code}
+
+        if not self.api_key:
+            return failure("SOLVER_KEY_REQUIRED")
+        if self.base_url != "https://api.nocaptchaai.com":
+            return failure("SOLVER_ENDPOINT_NOT_ALLOWED")
+        try:
+            url = urlsplit(website_url)
+            valid_url = (url.scheme == "https" and bool(url.hostname)
+                         and not url.username and not url.password and url.port in {None, 443})
+        except (ValueError, TypeError):
+            valid_url = False
+        if (not valid_url or not isinstance(website_key, str)
+                or not website_key.strip() or len(website_key) > 2000):
+            return failure("SOLVER_INPUT_INVALID")
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or not 0 < timeout <= 300):
+            return failure("SOLVER_TIMEOUT_INVALID")
+        try:
+            async with asyncio.timeout(timeout):
+                created = await self._post("/createTask", {
+                    "clientKey": self.api_key,
+                    "task": {"type": "TurnstileTaskProxyLess", "websiteURL": website_url,
+                             "websiteKey": website_key},
+                })
+                if not isinstance(created, dict) or created.get("errorId"):
+                    return failure("SOLVER_CREATE_FAILED")
+                task_id = created.get("taskId")
+                if (isinstance(task_id, bool) or not isinstance(task_id, (str, int))
+                        or not str(task_id).strip() or len(str(task_id)) > 256):
+                    return failure("SOLVER_CREATE_UNCERTAIN")
+                while True:
+                    await asyncio.sleep(2)
+                    result = await self._post("/getTaskResult", {
+                        "clientKey": self.api_key, "taskId": task_id,
+                    })
+                    if not isinstance(result, dict) or result.get("errorId"):
+                        return failure("SOLVER_RESULT_FAILED")
+                    if result.get("status") == "failed":
+                        return failure("SOLVER_RESULT_FAILED")
+                    if result.get("status") == "ready":
+                        solution = result.get("solution")
+                        token = solution.get("token") if isinstance(solution, dict) else None
+                        if not isinstance(token, str) or not token.strip() or len(token) > 32768:
+                            return failure("SOLVER_TOKEN_INVALID")
+                        return {"ok": True, "token": token, "error": None}
+                    if result.get("status") not in {"idle", "processing"}:
+                        return failure("SOLVER_STATUS_INVALID")
+        except TimeoutError:
+            return failure("SOLVER_TIMEOUT_UNCERTAIN")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - never disclose provider bodies/credentials
+            return failure("SOLVER_REQUEST_UNCERTAIN")
 
     async def balance(self) -> dict:
         return await self._post("/getBalance", {"clientKey": self.api_key})
@@ -182,34 +281,27 @@ class NoCaptchaAIClient:
         if not self.api_key:
             return False, "NOCAPTCHA_API_KEY is not set"
 
+        if self.base_url != "https://api.nocaptchaai.com":
+            return False, "Solver endpoint not allowed"
+
         import json
-        import urllib.error
-        import urllib.request
+        import math
 
-        def call():
-            req = urllib.request.Request(
-                f"{self.base_url}/balance",
-                headers={"apikey": self.api_key, "Accept": "application/json"},
-                method="GET",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=25) as resp:
-                    return resp.status, resp.read().decode()
-            except urllib.error.HTTPError as e:
-                return e.code, e.read().decode()
-
-        status, body = await asyncio.to_thread(call)
         try:
-            data = json.loads(body) if body else {}
-        except ValueError:
-            return False, "Solver returned invalid JSON"
+            async with asyncio.timeout(30):
+                status, data = await self._request("/balance")
+        except Exception:  # noqa: BLE001 - never disclose credentials or provider bodies
+            return False, "Solver validation request failed"
 
-        text = json.dumps(data)
-        if "Invalid apikey" in text or "invalid apikey" in text.lower():
+        if "invalid apikey" in json.dumps(data).lower():
             return False, "Solver key rejected"
-        if isinstance(data, dict) and data.get("errorId"):
+        if status != 200 or not isinstance(data, dict) or data.get("errorId") or data.get("error"):
             return False, "Solver rejected validation"
-        return status == 200, "Solver validation completed"
+        balance = data.get("balance")
+        if (isinstance(balance, bool) or not isinstance(balance, (int, float))
+                or not math.isfinite(balance) or balance < 0):
+            return False, "Solver validation response invalid"
+        return True, "Solver key accepted; balance available" if balance > 0 else "Solver key accepted; zero balance"
 
     async def solve_recaptcha_v2(self, website_url: str, website_key: str, invisible: bool = False,
                                  timeout: float = 180.0) -> dict:

@@ -9,8 +9,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from .contracts import ApprovalRequest, TaskRequest
@@ -107,6 +108,7 @@ class ActionPolicy:
         if any(not p.is_file() for p in self.upload_paths):
             raise ValueError("Uploads must be regular files")
         self.error_code: str | None = None
+        self.diagnostic: dict | None = None
         self.actions = 0
         self.mutated = False
 
